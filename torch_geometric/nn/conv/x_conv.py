@@ -1,14 +1,19 @@
-from __future__ import division
+from typing import Optional
 
 from math import ceil
 
 import torch
+from torch import Tensor
 from torch.nn import Sequential as S, Linear as L, BatchNorm1d as BN
 from torch.nn import ELU, Conv1d
-from torch_cluster import knn_graph
 from torch_geometric.nn import Reshape
 
 from ..inits import reset
+
+try:
+    from torch_cluster import knn_graph
+except ImportError:
+    knn_graph = None
 
 
 class XConv(torch.nn.Module):
@@ -47,12 +52,17 @@ class XConv(torch.nn.Module):
             classical convolutional operators. (default: :obj:`1`)
         bias (bool, optional): If set to :obj:`False`, the layer will not learn
             an additive bias. (default: :obj:`True`)
-        **kwargs (optional): Additional arguments of
-            :class:`torch_cluster.knn_graph`.
+        num_workers (int): Number of workers to use for k-NN computation.
+            Has no effect in case :obj:`batch` is not :obj:`None`, or the input
+            lies on the GPU. (default: :obj:`1`)
     """
-    def __init__(self, in_channels, out_channels, dim, kernel_size,
-                 hidden_channels=None, dilation=1, bias=True, **kwargs):
+    def __init__(self, in_channels: int, out_channels: int, dim: int,
+                 kernel_size: int, hidden_channels: Optional[int] = None,
+                 dilation: int = 1, bias: bool = True, num_workers: int = 1):
         super(XConv, self).__init__()
+
+        if knn_graph is None:
+            raise ImportError('`XConv` requires `torch-cluster`.')
 
         self.in_channels = in_channels
         if hidden_channels is None:
@@ -63,7 +73,7 @@ class XConv(torch.nn.Module):
         self.dim = dim
         self.kernel_size = kernel_size
         self.dilation = dilation
-        self.kwargs = kwargs
+        self.num_workers = num_workers
 
         C_in, C_delta, C_out = in_channels, hidden_channels, out_channels
         D, K = dim, kernel_size
@@ -107,13 +117,15 @@ class XConv(torch.nn.Module):
         reset(self.mlp2)
         reset(self.conv)
 
-    def forward(self, x, pos, batch=None):
+    def forward(self, x: Tensor, pos: Tensor, batch: Optional[Tensor] = None):
         """"""
         pos = pos.unsqueeze(-1) if pos.dim() == 1 else pos
         (N, D), K = pos.size(), self.kernel_size
 
-        row, col = knn_graph(pos, K * self.dilation, batch, loop=True,
-                             flow='target_to_source', **self.kwargs)
+        edge_index = knn_graph(pos, K * self.dilation, batch, loop=True,
+                               flow='target_to_source',
+                               num_workers=self.num_workers)
+        row, col = edge_index[0], edge_index[1]
 
         if self.dilation > 1:
             dil = self.dilation

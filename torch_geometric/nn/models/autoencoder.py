@@ -1,14 +1,12 @@
-import math
-import random
-
 import torch
 from sklearn.metrics import roc_auc_score, average_precision_score
-from torch_geometric.utils import to_undirected, negative_sampling
+from torch_geometric.utils import (negative_sampling, remove_self_loops,
+                                   add_self_loops)
 
 from ..inits import reset
 
 EPS = 1e-15
-MAX_LOGVAR = 10
+MAX_LOGSTD = 10
 
 
 class InnerProductDecoder(torch.nn.Module):
@@ -74,69 +72,8 @@ class GAE(torch.nn.Module):
         return self.encoder(*args, **kwargs)
 
     def decode(self, *args, **kwargs):
-        r"""Runs the decoder and computes edge probabilties."""
+        r"""Runs the decoder and computes edge probabilities."""
         return self.decoder(*args, **kwargs)
-
-    def split_edges(self, data, val_ratio=0.05, test_ratio=0.1):
-        r"""Splits the edges of a :obj:`torch_geometric.data.Data` object
-        into positve and negative train/val/test edges.
-
-        Args:
-            data (Data): The data object.
-            val_ratio (float, optional): The ratio of positive validation
-                edges. (default: :obj:`0.05`)
-            test_ratio (float, optional): The ratio of positive test
-                edges. (default: :obj:`0.1`)
-        """
-
-        assert 'batch' not in data  # No batch-mode.
-
-        row, col = data.edge_index
-        data.edge_index = None
-
-        # Return upper triangular portion.
-        mask = row < col
-        row, col = row[mask], col[mask]
-
-        n_v = int(math.floor(val_ratio * row.size(0)))
-        n_t = int(math.floor(test_ratio * row.size(0)))
-
-        # Positive edges.
-        perm = torch.randperm(row.size(0))
-        row, col = row[perm], col[perm]
-
-        r, c = row[:n_v], col[:n_v]
-        data.val_pos_edge_index = torch.stack([r, c], dim=0)
-        r, c = row[n_v:n_v + n_t], col[n_v:n_v + n_t]
-        data.test_pos_edge_index = torch.stack([r, c], dim=0)
-
-        r, c = row[n_v + n_t:], col[n_v + n_t:]
-        data.train_pos_edge_index = torch.stack([r, c], dim=0)
-        data.train_pos_edge_index = to_undirected(data.train_pos_edge_index)
-
-        # Negative edges.
-        num_nodes = data.num_nodes
-        neg_adj_mask = torch.ones(num_nodes, num_nodes, dtype=torch.uint8)
-        neg_adj_mask = neg_adj_mask.triu(diagonal=1).to(torch.bool)
-        neg_adj_mask[row, col] = 0
-
-        neg_row, neg_col = neg_adj_mask.nonzero().t()
-        perm = random.sample(range(neg_row.size(0)),
-                             min(n_v + n_t, neg_row.size(0)))
-        perm = torch.tensor(perm)
-        perm = perm.to(torch.long)
-        neg_row, neg_col = neg_row[perm], neg_col[perm]
-
-        neg_adj_mask[neg_row, neg_col] = 0
-        data.train_neg_adj_mask = neg_adj_mask
-
-        row, col = neg_row[:n_v], neg_col[:n_v]
-        data.val_neg_edge_index = torch.stack([row, col], dim=0)
-
-        row, col = neg_row[n_v:n_v + n_t], neg_col[n_v:n_v + n_t]
-        data.test_neg_edge_index = torch.stack([row, col], dim=0)
-
-        return data
 
     def recon_loss(self, z, pos_edge_index):
         r"""Given latent variables :obj:`z`, computes the binary cross
@@ -150,6 +87,10 @@ class GAE(torch.nn.Module):
 
         pos_loss = -torch.log(
             self.decoder(z, pos_edge_index, sigmoid=True) + EPS).mean()
+
+        # Do not include self-loops in negative samples
+        pos_edge_index, _ = remove_self_loops(pos_edge_index)
+        pos_edge_index, _ = add_self_loops(pos_edge_index)
 
         neg_edge_index = negative_sampling(pos_edge_index, z.size(0))
         neg_loss = -torch.log(1 -
@@ -200,36 +141,36 @@ class VGAE(GAE):
     def __init__(self, encoder, decoder=None):
         super(VGAE, self).__init__(encoder, decoder)
 
-    def reparametrize(self, mu, logvar):
+    def reparametrize(self, mu, logstd):
         if self.training:
-            return mu + torch.randn_like(logvar) * torch.exp(logvar)
+            return mu + torch.randn_like(logstd) * torch.exp(logstd)
         else:
             return mu
 
     def encode(self, *args, **kwargs):
         """"""
-        self.__mu__, self.__logvar__ = self.encoder(*args, **kwargs)
-        self.__logvar__ = self.__logvar__.clamp(max=MAX_LOGVAR)
-        z = self.reparametrize(self.__mu__, self.__logvar__)
+        self.__mu__, self.__logstd__ = self.encoder(*args, **kwargs)
+        self.__logstd__ = self.__logstd__.clamp(max=MAX_LOGSTD)
+        z = self.reparametrize(self.__mu__, self.__logstd__)
         return z
 
-    def kl_loss(self, mu=None, logvar=None):
+    def kl_loss(self, mu=None, logstd=None):
         r"""Computes the KL loss, either for the passed arguments :obj:`mu`
-        and :obj:`logvar`, or based on latent variables from last encoding.
+        and :obj:`logstd`, or based on latent variables from last encoding.
 
         Args:
             mu (Tensor, optional): The latent space for :math:`\mu`. If set to
                 :obj:`None`, uses the last computation of :math:`mu`.
                 (default: :obj:`None`)
-            logvar (Tensor, optional): The latent space for
-                :math:`\log\sigma^2`.  If set to :obj:`None`, uses the last
+            logstd (Tensor, optional): The latent space for
+                :math:`\log\sigma`.  If set to :obj:`None`, uses the last
                 computation of :math:`\log\sigma^2`.(default: :obj:`None`)
         """
         mu = self.__mu__ if mu is None else mu
-        logvar = self.__logvar__ if logvar is None else logvar.clamp(
-            max=MAX_LOGVAR)
+        logstd = self.__logstd__ if logstd is None else logstd.clamp(
+            max=MAX_LOGSTD)
         return -0.5 * torch.mean(
-            torch.sum(1 + logvar - mu**2 - logvar.exp(), dim=1))
+            torch.sum(1 + 2 * logstd - mu**2 - logstd.exp()**2, dim=1))
 
 
 class ARGA(GAE):
@@ -302,15 +243,15 @@ class ARGVA(ARGA):
         return self.VGAE.__mu__
 
     @property
-    def __logvar__(self):
-        return self.VGAE.__logvar__
+    def __logstd__(self):
+        return self.VGAE.__logstd__
 
-    def reparametrize(self, mu, logvar):
-        return self.VGAE.reparametrize(mu, logvar)
+    def reparametrize(self, mu, logstd):
+        return self.VGAE.reparametrize(mu, logstd)
 
     def encode(self, *args, **kwargs):
         """"""
         return self.VGAE.encode(*args, **kwargs)
 
-    def kl_loss(self, mu=None, logvar=None):
-        return self.VGAE.kl_loss(mu, logvar)
+    def kl_loss(self, mu=None, logstd=None):
+        return self.VGAE.kl_loss(mu, logstd)

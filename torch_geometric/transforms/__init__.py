@@ -1,4 +1,5 @@
 from .compose import Compose
+from .to_sparse_tensor import ToSparseTensor
 from .constant import Constant
 from .distance import Distance
 from .cartesian import Cartesian
@@ -32,9 +33,14 @@ from .line_graph import LineGraph
 from .laplacian_lambda_max import LaplacianLambdaMax
 from .generate_mesh_normals import GenerateMeshNormals
 from .delaunay import Delaunay
+from .to_superpixels import ToSLIC
+from .gdc import GDC
+from .sign import SIGN
+from .grid_sampling import GridSampling
 
 __all__ = [
     'Compose',
+    'ToSparseTensor',
     'Constant',
     'Distance',
     'Cartesian',
@@ -68,4 +74,8 @@ __all__ = [
     'LaplacianLambdaMax',
     'GenerateMeshNormals',
     'Delaunay',
+    'ToSLIC',
+    'GDC',
+    'SIGN',
+    'GridSampling',
 ]
